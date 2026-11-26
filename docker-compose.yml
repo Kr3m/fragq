@@ -57,9 +57,16 @@ services:
       - ./certs:/certs:ro
       - caddy_data:/data
       - caddy_config:/config
+    networks:
+      - default
+      - fragdex
 
 volumes:
   db_data:
   fragq_data:
   caddy_data:
   caddy_config:
+networks:
+  fragdex:
+    external: true
+    name: fragdex_default

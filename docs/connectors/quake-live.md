@@ -50,7 +50,7 @@ It is one file, `fragq.py`, that works on both **minqlx** and **minqlxtended**.
 
 ## Voice moves
 
-With `qlx_fragqVoice 1`, the plugin sends FragQ the teams when a match starts and a few seconds after team
+With `qlx_fragqVoice 1`, the plugin sends FragQ the teams when the match or round countdown begins and a few seconds after team
 changes, and sends the players back to the lobby when the match ends or is aborted (`!abort` or an abort
 vote). FragQ then moves them between the queue's Discord voice channels. It needs:
 

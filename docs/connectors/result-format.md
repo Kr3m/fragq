@@ -21,6 +21,7 @@ Authorization: Bearer fq_...
 | `POST /link` | Link Steam accounts from the game | `{"steam_id": "7656…", "name": "in-game name", "discord": "user id or username"}`: ask the member to confirm the link in Discord |
 | `GET /steam/links` | Read linked accounts | Every link of a member of the connector's Discord server ([below](#linked-accounts)) |
 | `POST /voice` | Move players in voice | Move players between a queue's voice channels ([below](#voice-moves)) |
+| `POST /match` | Check linked players | `{"queue": "name"}` (optional): the FragQ matches running now and their players ([below](#active-matches)) |
 
 Answers are JSON. Refused requests have `"ok": false` and an `error` message:
 
@@ -213,3 +214,33 @@ print(send_result("https://fragq.example.com/api/connect/v1", "fq_...", {
 
 The [Quake Live plugin](https://github.com/D00MSDAYDEVICE/fragq/blob/main/app/plugins/minqlx/fragq.py)
 is a complete example, including retries and the linked-player check.
+
+## Active matches
+
+`POST /match` lists the FragQ matches running now (check-in, draft or waiting for a result) in the
+connector's queues, newest first, so a game server can check that the right players are on its teams.
+Send `{"queue": "name"}` (any case) for one queue, or `{}` for all of the connector's queues. An unknown
+queue name is answered `400`.
+
+```json
+{
+  "ok": true,
+  "matches": [
+    {
+      "match_id": 1234,
+      "queue": "chi",
+      "state": "waiting_report",
+      "started_at": 1794194577,
+      "team_names": ["Alpha", "Beta"],
+      "players": [
+        {"discord_id": "200000000000000001", "discord_name": "username", "steam_id": "76561198000000000", "team": 0},
+        {"discord_id": "200000000000000002", "discord_name": "other", "steam_id": null, "team": null}
+      ]
+    }
+  ]
+}
+```
+
+`team` is `0` or `1` for the match's first or second team, and `null` while the player is unpicked. These
+are FragQ's teams, not the game's red and blue. `steam_id` is the player's FragQ Steam link, or `null`
+without one.

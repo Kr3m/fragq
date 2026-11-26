@@ -142,6 +142,17 @@ first_host="${SITE_HOST%% *}"
   fi
 } > "$OUT"
 
+cat >> "$OUT" <<'CADDY'
+
+fragdex.kr3m.one {
+    encode zstd gzip
+    header -Server
+    reverse_proxy fragdex-app:8000 {
+        header_up X-Fragdex-Client-IP {client_ip}
+    }
+}
+CADDY
+
 echo "[fragq] TLS_MODE=$TLS_MODE SITE_HOST='$SITE_HOST' HTTP_PORT=$HTTP_PORT HTTPS_PORT=$HTTPS_PORT"
 echo "[fragq] Generated $OUT:"
 cat "$OUT"

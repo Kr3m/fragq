@@ -9,8 +9,8 @@ When a match ends the plugin works out the highlights (Top Damage, Least Damage,
 Most Frags, Highest Accuracy, Quitters) and a per-player table, and sends them to FragQ in one request.
 FragQ finds the pickup match the players were in and posts the results in its Discord channel.
 
-With qlx_fragqVoice 1 (and a key allowed to move players in voice), the plugin tells FragQ the teams when a
-match starts and after team changes, and sends everyone back to the lobby when it ends or is aborted. FragQ
+With qlx_fragqVoice 1 (and a key allowed to move players in voice), the plugin tells FragQ the teams when the
+match or round countdown begins and after team changes, and sends everyone back to the lobby when it ends or is aborted. FragQ
 moves the players between the queue's voice channels in Discord; that needs voice moves turned on for the queue.
 Admins can also move players by hand with !voice, for teams arranged in the game, with or without qlx_fragqVoice.
 
@@ -73,10 +73,12 @@ import urllib.request
 try:
     import minqlxtended as ql
     STOP_ALL = ql.Return.STOP_ALL
+    HOOK_FIRST = ql.Priority.HIGHEST
     RUNTIME = "minqlxtended"
 except ImportError:
     import minqlx as ql
     STOP_ALL = ql.RET_STOP_ALL
+    HOOK_FIRST = ql.PRI_HIGHEST
     RUNTIME = "minqlx"
 
 VERSION = "1.3.0"
@@ -201,23 +203,36 @@ class fragq(ql.Plugin):
         self._command_at = 0.0
         self._last = {"time": None, "message": "nothing sent yet"}
         self._voice_due = 0.0          # when to read the teams and send them (after team changes settle)
-        self._voice_out = None         # a voice request waiting for the worker
+        self._voice_out = collections.deque()  # ordered voice requests for the worker
         self._voice_last = "nothing sent yet"
-        self._voice_live = False       # teams were sent for a match that hasn't ended: an abort sends the lobby
+        self._voice_live = False
+        self._voice_players = set()    # team players, including those who leave before the match ends
+        self._voice_generation = 0     # invalidates callbacks from a previous match
         self._voice_cmd_at = 0.0
         self._stop = threading.Event()
         self._wake = threading.Event()
         self.load_config()
 
-        self.add_hook("stats", self.handle_stats)
+        stats_enabled = _int(self.get_cvar("zmq_stats_enable"), 0) != 0
+        self._voice_team_switch_hooked = RUNTIME == "minqlxtended" or stats_enabled
+        if stats_enabled:
+            self.add_hook("stats", self.handle_stats)
+        else:
+            self.logger.warning("fragq: ZMQ stats disabled; match results are unavailable")
         self.add_hook("player_loaded", self.handle_player_loaded)
         self.add_hook("player_disconnect", self.handle_player_disconnect)
         self.add_hook("team_switch_attempt", self.handle_team_switch_attempt)
-        self.add_hook("map", self.handle_map)
-        self.add_hook("game_start", self.handle_game_start)
-        self.add_hook("game_end", self.handle_game_end)
-        self.add_hook("new_game", self.handle_new_game)
-        self.add_hook("team_switch", self.handle_team_switch)
+        self.add_hook("map", self.handle_map, priority=HOOK_FIRST)
+        self.add_hook("game_countdown", self.handle_game_countdown, priority=HOOK_FIRST)
+        self.add_hook("round_countdown", self.handle_round_countdown, priority=HOOK_FIRST)
+        if RUNTIME == "minqlxtended" or stats_enabled:
+            self.add_hook("game_start", self.handle_game_start, priority=HOOK_FIRST)
+            self.add_hook("game_end", self.handle_game_end, priority=HOOK_FIRST)
+        self.add_hook("new_game", self.handle_new_game, priority=HOOK_FIRST)
+        if self._voice_team_switch_hooked:
+            self.add_hook("team_switch", self.handle_team_switch, priority=HOOK_FIRST)
+        if RUNTIME == "minqlx":
+            self.add_hook("set_configstring", self.handle_set_configstring, priority=HOOK_FIRST)
         self.add_hook("unload", self.handle_unload)
         self.add_command("link", self.cmd_link, usage="<discord id> | <player id> <discord id>")
         self.add_command("linkenforce", self.cmd_linkenforce, usage="[on|off]")
@@ -312,6 +327,8 @@ class fragq(ql.Plugin):
         self._warned.pop(sid, None)
 
     def handle_team_switch_attempt(self, player, old_team, new_team, *_):
+        if not self._voice_team_switch_hooked:
+            self._schedule_voice_teams()
         if not self._cfg.get("enforce") or _team(new_team) == "spectator":
             return
         sid = str(player.steam_id)
@@ -327,43 +344,76 @@ class fragq(ql.Plugin):
         return STOP_ALL
 
     def handle_map(self, *_):
+        self._finish_voice()
         self.load_config()   # picks up cvars changed since the last map
         with self._lock:
             self._match, self._report, self._finish_at = {}, None, 0.0
-            self._voice_due, self._voice_out = 0.0, None
-        self._voice_live = False
 
-    # game_start: (data) on minqlx, () on minqlxtended; game_end: (data) on minqlx, (aborted) on minqlxtended;
-    # new_game: () on both. No argument is needed, so *_ registers on both.
+    def handle_game_countdown(self, *_):
+        if not self.load_config().get("voice"):
+            self.logger.info("fragq: automatic voice move skipped: qlx_fragqVoice is disabled")
+            return
+        with self._lock:
+            self._voice_generation += 1
+        self._voice_live = True
+        teams = self._voice_teams()
+        if not teams:
+            self.logger.info("fragq: automatic voice move skipped: no eligible team players or unsupported game mode")
+        self._queue_voice(teams)
+
+    def handle_round_countdown(self, round_number):
+        self.handle_game_countdown()
+
+    # minqlx dispatches these two hooks on its ZMQ thread; read players on the game thread.
     def handle_game_start(self, *_):
-        if self._cfg.get("voice"):
-            teams = self._voice_teams()
-            self._voice_live = bool(teams)
-            self._queue_voice(teams)
+        with self._lock:
+            generation = self._voice_generation
+        self._voice_start_fallback(generation)
+
+    @ql.next_frame
+    def _voice_start_fallback(self, generation):
+        if generation == self._voice_generation and not self._voice_live and self._in_progress():
+            self.handle_game_countdown()
 
     def handle_game_end(self, *_):
-        self._voice_live = False
-        if self._cfg.get("voice"):
-            teams = self._voice_teams()
-            with self._lock:
-                self._voice_due = 0.0
-            if teams:
-                self._queue_voice({"lobby": [sid for ids in teams["teams"].values() for sid in ids]})
+        with self._lock:
+            generation = self._voice_generation
+        self._voice_end_on_frame(generation)
+
+    @ql.next_frame
+    def _voice_end_on_frame(self, generation):
+        if generation == self._voice_generation:
+            self._finish_voice()
+
+    def handle_set_configstring(self, index, value):
+        # minqlx's game_end requires ZMQ; CS_INTERMISSION is set when the match ends.
+        if index == 14 and value == "1":
+            self._finish_voice()
 
     def handle_new_game(self, *_):
         # !abort and abort votes restart the map: new_game in warmup, and game_end never comes.
-        if not self._voice_live or self._state() != "warmup":
+        if self._voice_live and self._state() == "warmup":
+            self._finish_voice()
+
+    def _finish_voice(self):
+        if not self._voice_live:
             return
         self._voice_live = False
+        with self._lock:
+            self._voice_due = 0.0
+            self._voice_generation += 1
         if self._cfg.get("voice"):
-            with self._lock:
-                self._voice_due = 0.0
-            lobby = self._everyone()
-            if lobby:
-                self._queue_voice({"lobby": lobby})
+            lobby = sorted(self._voice_players.union(self._everyone()))
+            for start in range(0, len(lobby), 64):
+                self._queue_voice({"lobby": lobby[start:start + 64]})
+        self._voice_players.clear()
 
     def handle_team_switch(self, player, old_team, new_team):
-        if self._cfg.get("voice") and self._in_progress():
+        self._schedule_voice_teams()
+
+    @ql.next_frame
+    def _schedule_voice_teams(self):
+        if self._cfg.get("voice") and self._voice_live and self._state() in ("countdown", "in_progress"):
             with self._lock:   # read the teams once the changes settle: one request for a whole shuffle
                 self._voice_due = time.time() + VOICE_SETTLE
             self._wake.set()
@@ -397,14 +447,17 @@ class fragq(ql.Plugin):
 
     def _queue_voice(self, payload):
         if payload:
+            for ids in payload.get("teams", {}).values():
+                self._voice_players.update(ids)
             with self._lock:
-                self._voice_out = payload
+                self._voice_out.append((_with_queue(payload, self._cfg), dict(self._cfg)))
             self._wake.set()
 
     @ql.next_frame
-    def _voice_snapshot(self):
+    def _voice_snapshot(self, generation):
         """The teams after a team change, read on the game thread for the worker to send."""
-        if self._in_progress():
+        if (generation == self._voice_generation and self._voice_live
+                and self._state() in ("countdown", "in_progress")):
             self._queue_voice(self._voice_teams())
 
     def handle_unload(self, plugin):
@@ -673,6 +726,8 @@ class fragq(ql.Plugin):
         while not self._stop.is_set():
             with self._lock:   # a finished match is sent FINAL_STATS_WAIT after its MATCH_REPORT
                 wait = max(0.0, self._finish_at - time.time()) if self._report is not None else 5.0
+                if self._voice_out:
+                    wait = 0.0
                 if self._voice_due:
                     wait = min(wait, max(0.0, self._voice_due - time.time()))
             if wait:
@@ -796,30 +851,37 @@ class fragq(ql.Plugin):
 
     # ------------------------------------------------------------ voice moves
 
+    def _voice_request(self, cfg, payload):
+        return self._request(cfg, "POST", "/voice", _with_queue(payload, cfg))
+
     def _run_voice(self, cfg):
         with self._lock:
             due = self._voice_due and time.time() >= self._voice_due
             if due:
                 self._voice_due = 0.0
-            payload, self._voice_out = self._voice_out, None
+            generation = self._voice_generation
+            item = self._voice_out.popleft() if self._voice_out else None
         if due:
-            self._voice_snapshot()   # comes back through _voice_out
-        if not payload or not cfg.get("voice"):
+            self._voice_snapshot(generation)   # comes back through _voice_out
+        if not item:
             return
-        data, error, _ = self._request(cfg, "POST", "/voice", _with_queue(payload, cfg))
+        payload, request_cfg = item
+        data, error, _ = self._voice_request(request_cfg, payload)
         if error:
             self.logger.warning(f"fragq: voice move request failed: {error}")
             self._voice_last = f"{time.strftime('%H:%M')} failed: {error}"
             return
         players = data.get("players") or []
         moved = sum(1 for p in players if p.get("status") == "moved")
+        counts = collections.Counter(p.get("status") for p in players)
+        self.logger.info("fragq: automatic voice move: queue=%s, statuses=%s", data.get("queue"), dict(counts))
         self._voice_last = f"{time.strftime('%H:%M')} {moved} of {len(players)} moved ({data.get('queue')})"
 
     @ql.thread
     def _manual_voice(self, reply_to, payload, label):
         """!voice: one request now, whatever qlx_fragqVoice says."""
         cfg = self._config()
-        data, error, _ = self._request(cfg, "POST", "/voice", _with_queue(payload, cfg))
+        data, error, _ = self._voice_request(cfg, payload)
         stamp = time.strftime('%H:%M')
         if error:
             self._voice_last = f"{stamp} !voice {label} failed: {error}"

@@ -841,6 +841,43 @@ def steam_links(c):
 	return dict(ok=True, links=out)
 
 
+MATCH_STATES = {0: "init", 1: "check_in", 2: "draft", 3: "waiting_report"}
+
+
+def active_matches(c, data):
+	"""
+	POST /match: {"queue": "name"} (optional). The FragQ matches running now in the connector's queues, newest
+	first, with each player's team (0 or 1 for the match's two teams, null while unpicked) so a game server can
+	check who belongs on its teams. Team 0/1 are FragQ's teams, not the game's red/blue.
+	"""
+	name = data.get("queue") if isinstance(data, dict) else None
+	if name is not None and not isinstance(name, str):
+		raise ConnectorError(400, "'queue' must be a queue name.")
+	queues = queue_objects(c)
+	if name is not None and name.strip():
+		named = [q for q, _ in queues if q.name.casefold() == name.strip().casefold()]   # any case, like /voice
+		if not named:
+			raise ConnectorError(400, f"This connector has no queue named '{name[:60]}'. Its queues: "
+									  f"{', '.join(q.name for q, _ in queues) or 'none'}.")
+		if len(named) > 1:
+			raise ConnectorError(400, f"This connector has {len(named)} queues named '{named[0].name}', in different "
+									  "channels. Give each server its own connector, or rename one of the queues.")
+		queue_ids = {named[0].id}
+	else:
+		queue_ids = {q.id for q, _ in queues}
+	steam_by_user = {uid: r["steam_id"] for uid, r in bot.steam.links.items()}
+	out = []
+	for m in sorted((m for m in bot.active_matches if m.queue.id in queue_ids), key=lambda m: m.start_time, reverse=True):
+		team_of = {p.id: idx for idx in (0, 1) for p in m.teams[idx] if p}
+		out.append(dict(
+			match_id=m.id, queue=m.queue.name, state=MATCH_STATES.get(m.state, str(m.state)), started_at=m.start_time,
+			team_names=[m.teams[0].name, m.teams[1].name],
+			players=[dict(discord_id=str(p.id), discord_name=get_nick(p), steam_id=steam_by_user.get(p.id),
+						  team=team_of.get(p.id)) for p in m.players if p],
+		))
+	return dict(ok=True, matches=out)
+
+
 def _link_answer(status, message, **extra):
 	return dict(ok=status in ("sent", "already_linked"), status=status, message=message, **extra)
 
