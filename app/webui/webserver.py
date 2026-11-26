@@ -958,7 +958,7 @@ async def connect_voice(c, body):
 
 
 async def connect_match(c, body):
-	return bot.connectors.active_matches(c, body)
+	return await bot.connectors.active_matches(c, body)
 
 
 async def download_plugin(request):

@@ -217,8 +217,14 @@ is a complete example, including retries and the linked-player check.
 
 ## Active matches
 
-`POST /match` lists the FragQ matches running now (check-in, draft or waiting for a result) in the
-connector's queues, newest first, so a game server can check that the right players are on its teams.
+`POST /match` lists the matches of the connector's queues that a game server can be playing now, newest
+first, so it can check that the right players are on its teams:
+
+- matches still in FragQ (check-in, draft, or a ranked match waiting for its result): `"finished": false`
+- unranked matches started in the last 6 hours: `"finished": true`, `"state": "started"`. An unranked match
+  leaves FragQ as soon as its teams are set, which is when the game begins, so these are the games being
+  played. Pick the newest one most of whose players are on the server.
+
 Send `{"queue": "name"}` (any case) for one queue, or `{}` for all of the connector's queues. An unknown
 queue name is answered `400`.
 
@@ -229,7 +235,8 @@ queue name is answered `400`.
     {
       "match_id": 1234,
       "queue": "chi",
-      "state": "waiting_report",
+      "state": "started",
+      "finished": true,
       "started_at": 1794194577,
       "team_names": ["Alpha", "Beta"],
       "players": [
